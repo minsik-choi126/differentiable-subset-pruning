@@ -15,7 +15,6 @@ class HeadImportanceMetric:
     Computes attention head importance scores using gradient-based methods.
 
     Based on "Are Sixteen Heads Really Better than One?" (Michel et al., 2019)
-    http://arxiv.org/abs/1905.10650
     """
 
     def __init__(
