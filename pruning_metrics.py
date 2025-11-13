@@ -1,21 +1,358 @@
 """
-Pruning Metrics for Attention Head Pruning
+Pruning Metrics and Techniques for Differentiable Subset Pruning
 
-This module contains refined metric calculations used in differentiable subset pruning.
+This module implements the core techniques from:
+- "Differentiable Subset Pruning of Transformer Heads" (Li et al., TACL 2021)
+- "Are Sixteen Heads Really Better than One?" (Michel et al., 2019)
+- "Analyzing Multi-Head Self-Attention" (Voita et al., 2019)
 """
 
 import torch
+import torch.nn as nn
 import numpy as np
 from typing import Dict, Optional, Tuple
 from tqdm import tqdm
 
 
+# ============================================================================
+# DSP: Differentiable Subset Pruning (Li et al., TACL 2021)
+# ============================================================================
+
+EPSILON = torch.finfo(torch.double).tiny
+
+
+def gumbel_soft_top_k(w: torch.Tensor, k: int, temperature: float) -> torch.Tensor:
+    """
+    Differentiable top-k selection using Gumbel-Softmax trick.
+
+    This is the core of Differentiable Subset Pruning (DSP).
+    It allows end-to-end learning of which k heads to keep by making
+    the top-k operation differentiable.
+
+    Args:
+        w: Importance weights of shape (n_total_heads,)
+        k: Number of heads to select (keep)
+        temperature: Temperature parameter for Gumbel-Softmax
+                    Lower temperature -> closer to hard selection
+
+    Returns:
+        Soft mask of shape (n_total_heads,) with sum ≈ k
+
+    Reference:
+        Li et al., "Differentiable Subset Pruning of Transformer Heads", TACL 2021
+        Section 3.2: Differentiable Subset Pruning
+    """
+    # Sample Gumbel noise
+    u = torch.rand_like(w) * (1 - EPSILON) + EPSILON
+    gumbel_noise = -torch.log(-torch.log(u))
+
+    # Add Gumbel noise to importance weights
+    r = gumbel_noise + w
+    epsilon = torch.ones_like(r) * EPSILON
+
+    # Iteratively compute soft top-k using sequential softmax
+    p = torch.zeros([k, w.size()[0]]).to(w.device).double()
+
+    # First selection
+    p[0] = torch.exp(nn.functional.log_softmax(r / temperature, 0))
+
+    # Subsequent selections (remove probability mass from already selected)
+    for j in range(1, k):
+        r = r + torch.log(torch.max(1 - p[j - 1], epsilon))
+        p[j] = torch.exp(nn.functional.log_softmax(r / temperature, 0))
+
+    # Sum probabilities across k selections
+    return p.sum(0)
+
+
+class STEFunction(torch.autograd.Function):
+    """
+    Straight-Through Estimator for hard top-k selection.
+
+    Forward: Hard selection (discrete)
+    Backward: Straight-through gradient (identity)
+
+    This provides an alternative to Gumbel-Softmax that uses
+    hard selection in forward pass but allows gradients to flow.
+
+    Reference:
+        Bengio et al., "Estimating or Propagating Gradients Through
+        Stochastic Neurons for Conditional Computation", 2013
+    """
+
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        Select top-k elements (hard selection).
+
+        Args:
+            input: Importance weights
+            k: Number of elements to select
+
+        Returns:
+            Binary mask with k ones
+        """
+        threshold = input.sort(descending=True)[0][k]
+        return (input > threshold).float()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """
+        Pass gradients through unchanged (straight-through).
+        """
+        return grad_output, None
+
+
+class TemperatureScheduler:
+    """
+    Temperature annealing scheduler for DSP.
+
+    Exponentially decays temperature from initial to final value
+    over a specified number of steps.
+
+    Reference:
+        Li et al., TACL 2021, Section 4.1: Training Details
+    """
+
+    def __init__(
+        self,
+        initial_temperature: float = 1000.0,
+        final_temperature: float = 1e-8,
+        cooldown_steps: int = 25000
+    ):
+        """
+        Args:
+            initial_temperature: Starting temperature (high for soft selection)
+            final_temperature: Ending temperature (low for hard selection)
+            cooldown_steps: Number of steps to anneal over
+        """
+        self.initial_temp = initial_temperature
+        self.final_temp = final_temperature
+        self.cooldown_steps = cooldown_steps
+
+        # Precompute log values for efficiency
+        self.log_initial = np.log(initial_temperature)
+        self.log_final = np.log(final_temperature)
+
+    def get_temperature(self, step: int) -> float:
+        """
+        Get temperature at given training step.
+
+        Args:
+            step: Current training step
+
+        Returns:
+            Temperature value
+        """
+        if step >= self.cooldown_steps:
+            return self.final_temp
+
+        # Exponential decay: T(t) = T_0 * exp(-t/τ * log(T_0/T_f))
+        progress = step / self.cooldown_steps
+        log_temp = self.log_initial - progress * (self.log_initial - self.log_final)
+
+        return np.exp(log_temp)
+
+
+class DSPHeadSelector:
+    """
+    Differentiable Subset Pruning head selector.
+
+    Maintains learnable importance weights and applies differentiable
+    top-k selection to determine which heads to keep.
+    """
+
+    def __init__(
+        self,
+        n_layers: int,
+        n_heads: int,
+        num_heads_to_keep: int,
+        device: torch.device,
+        use_ste: bool = False
+    ):
+        """
+        Args:
+            n_layers: Number of transformer layers
+            n_heads: Number of attention heads per layer
+            num_heads_to_keep: Number of heads to keep (k)
+            device: Device for computation
+            use_ste: Whether to use Straight-Through Estimator
+        """
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.num_heads_to_keep = num_heads_to_keep
+        self.device = device
+        self.use_ste = use_ste
+
+        # Learnable importance weights (w in the paper)
+        self.w = nn.Parameter(
+            torch.empty([n_layers, n_heads], device=device).double()
+        )
+        nn.init.xavier_uniform_(self.w)
+
+    def get_mask(self, temperature: Optional[float] = None) -> torch.Tensor:
+        """
+        Compute head selection mask using DSP.
+
+        Args:
+            temperature: Temperature for Gumbel-Softmax (ignored if use_ste=True)
+
+        Returns:
+            Mask of shape (n_layers, n_heads)
+        """
+        if self.use_ste:
+            # Straight-through estimator (hard selection)
+            mask = STEFunction.apply(
+                self.w.view(-1),
+                self.num_heads_to_keep
+            ).view_as(self.w)
+        else:
+            # Gumbel-Softmax (soft selection)
+            if temperature is None:
+                raise ValueError("Temperature required for Gumbel-Softmax")
+
+            mask = gumbel_soft_top_k(
+                self.w.view(-1),
+                self.num_heads_to_keep,
+                temperature
+            ).view_as(self.w)
+
+        return mask
+
+    def get_importance_weights(self) -> torch.Tensor:
+        """Get current importance weights."""
+        return self.w.detach()
+
+
+# ============================================================================
+# L0 Regularization (Voita et al., ACL 2019)
+# ============================================================================
+
+class ConcreteGate(nn.Module):
+    """
+    Concrete (continuous relaxation) gate for L0 regularization.
+
+    Uses stretched concrete distribution to create differentiable gates
+    that can be trained to be approximately binary (0 or 1).
+
+    Reference:
+        Voita et al., "Analyzing Multi-Head Self-Attention", ACL 2019
+        Louizos et al., "Learning Sparse Neural Networks through L0 Regularization", ICLR 2018
+    """
+
+    def __init__(
+        self,
+        shape: list,
+        temperature: float = 0.33,
+        stretch_limits: Tuple[float, float] = (-0.1, 1.1),
+        l0_penalty: float = 1.0,
+        eps: float = 1e-6
+    ):
+        """
+        Args:
+            shape: Shape of gate variable (can be broadcasted)
+            temperature: Concrete sigmoid temperature (lower = more discrete)
+            stretch_limits: (min, max) value before clipping to [0, 1]
+            l0_penalty: Coefficient for L0 regularization
+            eps: Small value to avoid NaNs
+        """
+        super().__init__()
+        self.temperature = temperature
+        self.stretch_limits = stretch_limits
+        self.l0_penalty = l0_penalty
+        self.eps = eps
+
+        # Learnable gate parameters (log α in the paper)
+        self.log_a = nn.Parameter(torch.empty(shape))
+        nn.init.xavier_uniform_(self.log_a)
+
+    def forward(self, values: torch.Tensor, is_train: Optional[bool] = None):
+        """
+        Apply gate to values.
+
+        Args:
+            values: Tensor to gate
+            is_train: Whether in training mode (for sampling)
+
+        Returns:
+            Gated values
+        """
+        is_train = self.training if is_train is None else is_train
+        gates = self.get_gates(is_train)
+        return values * gates
+
+    def get_gates(self, is_train: bool) -> torch.Tensor:
+        """
+        Sample gate activations in [0, 1] interval.
+
+        Args:
+            is_train: Whether to add noise (training) or use expectation
+
+        Returns:
+            Gate values
+        """
+        low, high = self.stretch_limits
+
+        if is_train:
+            # Sample from concrete distribution
+            shape = self.log_a.size()
+            noise = (1 - 2 * self.eps) * torch.rand(shape).to(self.log_a.device) + self.eps
+
+            # Gumbel-Softmax trick for binary concrete
+            logit = (torch.log(noise) - torch.log(1 - noise) + self.log_a) / self.temperature
+            concrete = torch.sigmoid(logit)
+        else:
+            # Use expectation (no noise)
+            concrete = torch.sigmoid(self.log_a)
+
+        # Stretch and clip to [0, 1]
+        stretched = concrete * (high - low) + low
+        clipped = torch.clamp(stretched, 0, 1)
+
+        return clipped
+
+    def get_penalty(self) -> torch.Tensor:
+        """
+        Compute L0 regularization penalty.
+
+        Returns:
+            Penalty value to minimize
+        """
+        low, high = self.stretch_limits
+        assert low < 0.0, "Lower stretch limit must be negative for L0 penalty"
+
+        # Compute P(gate is open) = P(stretched sigmoid > 0)
+        p_open = torch.sigmoid(self.log_a - self.temperature * np.log(-low / high))
+        p_open = torch.clamp(p_open, self.eps, 1.0 - self.eps)
+
+        # L0 penalty: sum of opening probabilities
+        return self.l0_penalty * torch.sum(p_open)
+
+    def get_sparsity_rate(self) -> float:
+        """
+        Compute fraction of gates that are closed (zero).
+
+        Returns:
+            Sparsity rate in [0, 1]
+        """
+        gates = self.get_gates(is_train=False)
+        is_closed = (gates == 0.0)
+        return torch.mean(is_closed.float()).item()
+
+
+# ============================================================================
+# Head Importance (Michel et al., NeurIPS 2019)
+# ============================================================================
+
 class HeadImportanceMetric:
     """
-    Computes attention head importance scores using gradient-based methods.
+    Gradient-based head importance estimation.
 
-    Based on "Are Sixteen Heads Really Better than One?" (Michel et al., 2019)
-    http://arxiv.org/abs/1905.10650
+    Computes importance scores by measuring how much the loss changes
+    when a head is masked (using gradient of loss w.r.t. mask).
+
+    Reference:
+        Michel et al., "Are Sixteen Heads Really Better than One?", NeurIPS 2019
     """
 
     def __init__(
@@ -30,9 +367,9 @@ class HeadImportanceMetric:
         Args:
             n_layers: Number of transformer layers
             n_heads: Number of attention heads per layer
-            device: Device to run computations on
-            normalize_by_layer: Whether to apply layer-wise normalization
-            normalize_global: Whether to apply global min-max normalization
+            device: Device for computation
+            normalize_by_layer: Apply layer-wise L2 normalization
+            normalize_global: Apply global min-max normalization
         """
         self.n_layers = n_layers
         self.n_heads = n_heads
@@ -42,64 +379,72 @@ class HeadImportanceMetric:
 
     def compute(
         self,
-        model: torch.nn.Module,
+        model: nn.Module,
         dataloader: torch.utils.data.DataLoader,
         head_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute head importance scores.
 
+        Importance is measured as: I_h = |∂L/∂m_h|
+        where L is the loss and m_h is the mask for head h.
+
         Args:
-            model: The model to evaluate
+            model: Model to evaluate
             dataloader: DataLoader for computing importance
-            head_mask: Optional mask to apply (default: all ones)
+            head_mask: Optional initial mask (default: all ones)
 
         Returns:
-            Tensor of shape (n_layers, n_heads) with importance scores
+            Importance tensor of shape (n_layers, n_heads)
         """
-        # Initialize head importance and mask
+        # Initialize
         head_importance = torch.zeros(self.n_layers, self.n_heads).to(self.device)
 
         if head_mask is None:
             head_mask = torch.ones(self.n_layers, self.n_heads).to(self.device)
 
-        head_mask.requires_grad_(requires_grad=True)
+        head_mask.requires_grad_(True)
         model.apply_masks(head_mask)
 
-        # Accumulate gradients
-        tot_tokens = 0.0
+        total_tokens = 0.0
 
+        # Accumulate gradients over dataset
         for inputs in tqdm(dataloader, desc="Computing head importance"):
-            # Move inputs to device
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
             # Forward pass
             outputs = model(**inputs)
             loss = outputs[0]
 
-            # Compute gradient with respect to head mask
+            # Compute gradient w.r.t. head mask
             grad = torch.autograd.grad(loss, head_mask)[0]
             head_importance += grad.abs().detach()
 
-            # Track number of tokens
-            tot_tokens += inputs["attention_mask"].float().detach().sum().item()
+            # Track number of tokens for normalization
+            total_tokens += inputs["attention_mask"].float().sum().item()
 
         # Normalize by number of tokens
-        head_importance /= tot_tokens
+        head_importance /= total_tokens
 
-        # Apply layer-wise normalization
+        # Apply normalizations
         if self.normalize_by_layer:
             head_importance = self._normalize_by_layer(head_importance)
 
-        # Apply global normalization
         if self.normalize_global:
             head_importance = self._normalize_global(head_importance)
 
         return head_importance
 
-    def _normalize_by_layer(self, importance: torch.Tensor, exponent: float = 2) -> torch.Tensor:
-        """Apply L2 normalization across heads within each layer."""
-        norm_by_layer = torch.pow(torch.pow(importance, exponent).sum(-1), 1 / exponent)
+    def _normalize_by_layer(
+        self,
+        importance: torch.Tensor,
+        exponent: float = 2
+    ) -> torch.Tensor:
+        """Apply L2 normalization within each layer."""
+        norm_by_layer = torch.pow(
+            torch.pow(importance, exponent).sum(-1),
+            1 / exponent
+        )
         return importance / (norm_by_layer.unsqueeze(-1) + 1e-20)
 
     def _normalize_global(self, importance: torch.Tensor) -> torch.Tensor:
@@ -109,8 +454,12 @@ class HeadImportanceMetric:
         return (importance - min_val) / (max_val - min_val + 1e-20)
 
 
+# ============================================================================
+# Evaluation Metrics
+# ============================================================================
+
 class SparsityMetric:
-    """Computes sparsity metrics for pruned models."""
+    """Metrics for measuring sparsity of pruned models."""
 
     @staticmethod
     def compute_sparsity(mask: torch.Tensor) -> float:
@@ -118,7 +467,7 @@ class SparsityMetric:
         Compute sparsity percentage.
 
         Args:
-            mask: Binary mask tensor (1 = kept, 0 = pruned)
+            mask: Binary mask (1 = kept, 0 = pruned)
 
         Returns:
             Sparsity percentage (0-100)
@@ -133,7 +482,7 @@ class SparsityMetric:
         Compute ratio of remaining (unpruned) elements.
 
         Args:
-            mask: Binary mask tensor (1 = kept, 0 = pruned)
+            mask: Binary mask (1 = kept, 0 = pruned)
 
         Returns:
             Remaining ratio (0-100)
@@ -163,195 +512,86 @@ class SparsityMetric:
         }
 
 
-class TaskPerformanceMetric:
-    """Computes task-specific performance metrics."""
-
-    def __init__(self, task_name: str, output_mode: str = "classification"):
-        """
-        Args:
-            task_name: Name of the task (e.g., 'mnli', 'sst-2')
-            output_mode: 'classification' or 'regression'
-        """
-        self.task_name = task_name
-        self.output_mode = output_mode
-
-    def evaluate(
-        self,
-        model: torch.nn.Module,
-        dataloader: torch.utils.data.DataLoader,
-        device: torch.device,
-        head_mask: Optional[torch.Tensor] = None
-    ) -> float:
-        """
-        Evaluate model performance.
-
-        Args:
-            model: Model to evaluate
-            dataloader: Evaluation dataloader
-            device: Device to run on
-            head_mask: Optional head mask to apply
-
-        Returns:
-            Task performance score
-        """
-        if head_mask is not None:
-            model.apply_masks(head_mask)
-
-        model.eval()
-
-        all_preds = []
-        all_labels = []
-
-        with torch.no_grad():
-            for inputs in tqdm(dataloader, desc="Evaluating"):
-                inputs = {k: v.to(device) for k, v in inputs.items()}
-
-                outputs = model(**inputs)
-                logits = outputs[1]
-                labels = inputs["labels"]
-
-                all_preds.append(logits.detach().cpu().numpy())
-                all_labels.append(labels.detach().cpu().numpy())
-
-        # Concatenate all predictions and labels
-        preds = np.concatenate(all_preds, axis=0)
-        labels = np.concatenate(all_labels, axis=0)
-
-        # Compute final predictions
-        if self.output_mode == "classification":
-            preds = np.argmax(preds, axis=1)
-        else:
-            preds = np.squeeze(preds)
-
-        # Compute metric (accuracy for classification)
-        if self.output_mode == "classification":
-            accuracy = (preds == labels).mean()
-            return accuracy
-        else:
-            # For regression, could use MSE or correlation
-            from scipy.stats import pearsonr, spearmanr
-            pearson_corr = pearsonr(preds, labels)[0]
-            return pearson_corr
-
-
-class NERMetric:
-    """Metrics for Named Entity Recognition tasks."""
-
-    def __init__(self, label_map: Dict[int, str]):
-        """
-        Args:
-            label_map: Mapping from label IDs to label names
-        """
-        self.label_map = label_map
-
-    def compute(
-        self,
-        predictions: np.ndarray,
-        label_ids: np.ndarray
-    ) -> Dict[str, float]:
-        """
-        Compute NER metrics (precision, recall, F1).
-
-        Args:
-            predictions: Model predictions (batch_size, seq_len, num_labels)
-            label_ids: Ground truth labels (batch_size, seq_len)
-
-        Returns:
-            Dictionary with precision, recall, and F1 scores
-        """
-        from seqeval.metrics import f1_score, precision_score, recall_score
-
-        preds_list, labels_list = self._align_predictions(predictions, label_ids)
-
-        return {
-            "precision": precision_score(labels_list, preds_list),
-            "recall": recall_score(labels_list, preds_list),
-            "f1": f1_score(labels_list, preds_list),
-        }
-
-    def _align_predictions(
-        self,
-        predictions: np.ndarray,
-        label_ids: np.ndarray
-    ) -> Tuple[list, list]:
-        """Align predictions with labels, filtering padding tokens."""
-        preds = np.argmax(predictions, axis=2)
-        batch_size, seq_len = preds.shape
-
-        preds_list = [[] for _ in range(batch_size)]
-        labels_list = [[] for _ in range(batch_size)]
-
-        ignore_index = -100  # CrossEntropyLoss default ignore_index
-
-        for i in range(batch_size):
-            for j in range(seq_len):
-                if label_ids[i, j] != ignore_index:
-                    labels_list[i].append(self.label_map[label_ids[i][j]])
-                    preds_list[i].append(self.label_map[preds[i][j]])
-
-        return preds_list, labels_list
-
-
 class PruningMetricTracker:
     """
-    Tracks multiple metrics during the pruning process.
+    Tracks metrics during the pruning process.
     """
 
     def __init__(self):
         self.history = {
+            "step": [],
             "sparsity": [],
             "performance": [],
             "remaining_heads": [],
+            "temperature": [],
         }
 
     def update(
         self,
+        step: int,
         mask: torch.Tensor,
-        performance: float
+        performance: float,
+        temperature: Optional[float] = None
     ):
         """
-        Record metrics at current pruning step.
+        Record metrics at current step.
 
         Args:
+            step: Training step
             mask: Current head mask
-            performance: Current task performance
+            performance: Task performance metric
+            temperature: Current temperature (for DSP)
         """
-        sparsity_metric = SparsityMetric()
-        stats = sparsity_metric.get_stats(mask)
+        stats = SparsityMetric.get_stats(mask)
 
+        self.history["step"].append(step)
         self.history["sparsity"].append(stats["sparsity_pct"])
         self.history["performance"].append(performance * 100)
         self.history["remaining_heads"].append(stats["remaining_heads"])
+
+        if temperature is not None:
+            self.history["temperature"].append(temperature)
 
     def get_history(self) -> Dict[str, list]:
         """Get full tracking history."""
         return self.history
 
     def get_best(self) -> Dict[str, float]:
-        """Get best performance and corresponding sparsity."""
+        """Get best performance and corresponding metrics."""
         if not self.history["performance"]:
             return {}
 
         best_idx = np.argmax(self.history["performance"])
 
-        return {
+        result = {
+            "best_step": self.history["step"][best_idx],
             "best_performance": self.history["performance"][best_idx],
             "best_sparsity": self.history["sparsity"][best_idx],
             "best_remaining_heads": self.history["remaining_heads"][best_idx],
         }
 
+        if self.history["temperature"]:
+            result["best_temperature"] = self.history["temperature"][best_idx]
+
+        return result
+
+
+# ============================================================================
+# Utility Functions
+# ============================================================================
 
 def convert_gate_to_mask(
     gates: torch.Tensor,
-    num_of_heads: Optional[int] = None
+    num_of_heads: Optional[int] = None,
+    threshold: float = 0.5
 ) -> torch.Tensor:
     """
     Convert gate values to binary masks.
 
     Args:
         gates: Gate values (continuous or binary)
-        num_of_heads: Number of heads to keep (top-k selection)
-                     If None, use threshold of 0.5
+        num_of_heads: If specified, keep top-k heads
+        threshold: Threshold for binarization (if num_of_heads is None)
 
     Returns:
         Binary mask tensor
@@ -359,7 +599,7 @@ def convert_gate_to_mask(
     head_mask = torch.zeros_like(gates)
 
     if num_of_heads is not None:
-        # Select top-k heads
+        # Top-k selection
         flat_gates = gates.view(-1)
         top_k_indices = flat_gates.argsort(descending=True)[:num_of_heads]
 
@@ -367,7 +607,41 @@ def convert_gate_to_mask(
         flat_mask[top_k_indices] = 1.0
         head_mask = flat_mask.view_as(gates)
     else:
-        # Use threshold
-        head_mask = (gates > 0.5).float()
+        # Threshold-based selection
+        head_mask = (gates > threshold).float()
 
     return head_mask
+
+
+def print_head_mask(mask: torch.Tensor, logger=None):
+    """
+    Pretty-print a head mask tensor.
+
+    Args:
+        mask: Head mask of shape (n_layers, n_heads)
+        logger: Optional logger (uses print if None)
+    """
+    n_layers, n_heads = mask.shape
+
+    def log(msg):
+        if logger:
+            logger.info(msg)
+        else:
+            print(msg)
+
+    # Header
+    log("Layer/Head >\t" + "\t".join(f"{i+1}" for i in range(n_heads)))
+
+    # Each layer
+    for layer_idx in range(n_layers):
+        if mask.dtype in [torch.long, torch.int]:
+            values = "\t".join(f"{int(x)}" for x in mask[layer_idx].cpu())
+        else:
+            values = "\t".join(f"{x:.4f}" for x in mask[layer_idx].cpu())
+
+        log(f"Layer {layer_idx + 1}:\t{values}")
+
+    # Summary
+    stats = SparsityMetric.get_stats(mask)
+    log(f"\nRemaining heads: {stats['remaining_heads']}/{stats['total_heads']} "
+        f"({stats['remaining_pct']:.1f}%)")
