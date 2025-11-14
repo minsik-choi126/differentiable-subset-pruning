@@ -44,9 +44,9 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoConfig,
     default_data_collator,
-    AdamW,
     get_linear_schedule_with_warmup,
 )
+from torch.optim import AdamW
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\n사용 디바이스: {DEVICE}")
