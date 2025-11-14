@@ -28,9 +28,10 @@ num_epochs_ft=2        # ❌ 논문: until convergence (~3 epochs)
 - 이상한 mask 패턴 (Layer 12이 완전히 pruning됨)
 
 **근본 원인**:
-1. **Temperature 범위가 너무 극단적**: 1000 → 0.01
-   - `exp(w/0.01)` 계산 시 overflow 발생
+1. **Final temperature가 너무 낮음**: 0.01 (should be 0.1)
+   - `exp(w/0.01)` 계산 시 underflow 발생
    - Gumbel-Softmax가 불안정해짐
+   - **Note**: Initial temperature 1000은 논문 Appendix A에서 명시한 올바른 값!
 
 2. **Float64/Float32 타입 불일치**:
    - w 파라미터: `float64` (`.double()`)
@@ -64,28 +65,35 @@ num_epochs_ft = 3     # 논문: "until convergence" (BERT SST-2 표준)
 
 **Note**: Pipelined의 w 학습 epoch은 BERT가 freeze되므로, 실제 BERT 학습 compute는 6 epochs.
 
-### 2. Temperature 범위 수정
+### 2. Temperature 범위 수정 (논문 Appendix A 기준)
 
-**Before**:
+**논문 Appendix A - Table 2**:
+- τini (initial temperature): **1000**
+- τend (final temperature): **0.1**
+- lr for wh: **0.5**
+- Ncooldown: **25000**
+
+**Before (Original Code)**:
 ```python
 TemperatureScheduler(
-    initial_temperature=1000.0,  # ❌ 너무 높음
-    final_temperature=1e-2,      # ❌ 너무 낮음 (0.01)
+    initial_temperature=1000.0,  # ✅ Correct (matches paper!)
+    final_temperature=1e-2,      # ❌ Wrong (0.01, should be 0.1)
 )
 ```
 
-**After**:
+**After (Fixed)**:
 ```python
 TemperatureScheduler(
-    initial_temperature=10.0,    # ✅ 안정적인 시작값
-    final_temperature=0.1,       # ✅ 안정적인 종료값
+    initial_temperature=1000.0,  # ✅ Paper Appendix A: τini = 1000
+    final_temperature=0.1,       # ✅ Paper Appendix A: τend = 0.1
 )
 ```
 
 **효과**:
-- Temperature 범위: 1000배 → 100배 차이로 축소
-- `exp(w/temperature)` 계산이 안정적
-- Overflow/underflow 방지
+- Final temperature를 0.01 → 0.1로 수정 (10배 증가)
+- `exp(w/0.01)`의 underflow 문제 해결
+- `exp(w/0.1)`은 안정적인 범위
+- **Initial temperature 1000은 논문에서 명시한 올바른 값!**
 
 ### 3. Dtype 일관성 (Float32)
 
@@ -144,8 +152,8 @@ optimizer_w.step()
 
 | Parameter | Before | After | 변경 이유 |
 |-----------|--------|-------|----------|
-| **Initial temp** | 1000.0 | **10.0** | Overflow 방지 |
-| **Final temp** | 0.01 | **0.1** | Underflow 방지 |
+| **Initial temp** | 1000.0 | **1000.0** ✅ | 논문 Appendix A 일치 |
+| **Final temp** | 0.01 ❌ | **0.1** ✅ | 논문 Appendix A 일치 (Underflow 방지) |
 | **w dtype** | float64 | **float32** | BERT와 일치 |
 | **Gradient clip** | ❌ 없음 | **✅ 1.0** | 안정성 향상 |
 
@@ -190,7 +198,7 @@ optimizer_w.step()
 - [x] **Pipelined base**: `num_epochs_base=3`
 - [x] **Pipelined w learning**: `num_epochs_score=1`
 - [x] **Pipelined fine-tune**: `num_epochs_ft=3`
-- [x] **Temperature initial**: `10.0`
+- [x] **Temperature initial**: `1000.0` (논문 Appendix A)
 - [x] **Temperature final**: `0.1`
 - [x] **w dtype**: `float32` (no `.double()`)
 - [x] **p dtype**: `float32` (no `.double()`)

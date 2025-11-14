@@ -94,7 +94,7 @@ class STEFunction(torch.autograd.Function):
 
 class TemperatureScheduler:
     """Temperature annealing scheduler."""
-    def __init__(self, initial_temperature=10.0, final_temperature=0.1, cooldown_steps=25000):
+    def __init__(self, initial_temperature=1000.0, final_temperature=0.1, cooldown_steps=25000):
         self.initial_temp = initial_temperature
         self.final_temp = final_temperature
         self.cooldown_steps = cooldown_steps
@@ -277,8 +277,8 @@ def run_joint_dsp(
 
     num_training_steps = len(train_loader) * num_epochs
     temp_scheduler = TemperatureScheduler(
-        initial_temperature=10.0,  # 1000 → 10 (더 안정적)
-        final_temperature=0.1,     # 1e-2 → 0.1 (numerical stability)
+        initial_temperature=1000.0,  # Paper Appendix A: τini = 1000
+        final_temperature=0.1,       # Paper Appendix A: τend = 0.1
         cooldown_steps=num_training_steps,
     )
 
@@ -440,8 +440,8 @@ def run_pipelined_dsp(
     # Temperature scheduler (1 epoch용)
     num_training_steps = len(train_loader) * num_epochs_score
     temp_scheduler = TemperatureScheduler(
-        initial_temperature=10.0,
-        final_temperature=0.1,
+        initial_temperature=1000.0,  # Paper Appendix A: τini = 1000
+        final_temperature=0.1,       # Paper Appendix A: τend = 0.1
         cooldown_steps=num_training_steps,
     )
 
