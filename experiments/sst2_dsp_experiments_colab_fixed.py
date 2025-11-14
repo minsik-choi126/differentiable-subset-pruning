@@ -70,7 +70,7 @@ def gumbel_soft_top_k(w: torch.Tensor, k: int, temperature: float) -> torch.Tens
     r = gumbel_noise + w
     epsilon = torch.ones_like(r) * EPSILON
 
-    p = torch.zeros([k, w.size()[0]]).to(w.device).double()
+    p = torch.zeros([k, w.size()[0]]).to(w.device)
     p[0] = torch.exp(nn.functional.log_softmax(r / temperature, 0))
 
     for j in range(1, k):
@@ -94,7 +94,7 @@ class STEFunction(torch.autograd.Function):
 
 class TemperatureScheduler:
     """Temperature annealing scheduler."""
-    def __init__(self, initial_temperature=1000.0, final_temperature=1e-2, cooldown_steps=25000):
+    def __init__(self, initial_temperature=10.0, final_temperature=0.1, cooldown_steps=25000):
         self.initial_temp = initial_temperature
         self.final_temp = final_temperature
         self.cooldown_steps = cooldown_steps
@@ -271,14 +271,14 @@ def run_joint_dsp(
     print(f"전체 heads: {total_heads}")
     print(f"유지: {keep_heads} ({keep_heads/total_heads*100:.1f}%)")
 
-    # Learnable importance weights
-    w = nn.Parameter(torch.randn(num_layers, num_heads).double().to(DEVICE))
+    # Learnable importance weights (float32로 변경 - numerical stability)
+    w = nn.Parameter(torch.randn(num_layers, num_heads).to(DEVICE))
     nn.init.xavier_uniform_(w)
 
     num_training_steps = len(train_loader) * num_epochs
     temp_scheduler = TemperatureScheduler(
-        initial_temperature=1000.0,
-        final_temperature=1e-2,
+        initial_temperature=10.0,  # 1000 → 10 (더 안정적)
+        final_temperature=0.1,     # 1e-2 → 0.1 (numerical stability)
         cooldown_steps=num_training_steps,
     )
 
@@ -312,32 +312,33 @@ def run_joint_dsp(
             if use_ste:
                 soft_mask = STEFunction.apply(w.view(-1), keep_heads).view_as(w)
             else:
-                soft_mask = gumbel_soft_top_k(w.view(-1).float(), keep_heads, temperature).double().view_as(w)
+                soft_mask = gumbel_soft_top_k(w.view(-1), keep_heads, temperature).view_as(w)
 
             outputs = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
-                head_mask=soft_mask.float(),
+                head_mask=soft_mask,
             )
 
             loss = outputs.loss
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # w와 model parameters 모두 clip
+            torch.nn.utils.clip_grad_norm_([w] + list(model.parameters()), 1.0)
             optimizer.step()
             scheduler.step()
 
             progress_bar.set_postfix({'loss': f'{loss.item():.4f}', 'temp': f'{temperature:.2e}'})
 
             if global_step % log_interval == 0:
-                acc, _ = evaluate(model, eval_loader, head_mask=soft_mask.float().detach(), desc="평가")
+                acc, _ = evaluate(model, eval_loader, head_mask=soft_mask.detach(), desc="평가")
                 best_acc = max(best_acc, acc)
                 print(f"\n[Step {global_step}] loss={loss.item():.4f}, acc={acc*100:.2f}%, best={best_acc*100:.2f}%")
 
     print("\n최종 hard mask 생성...")
-    final_mask = convert_gate_to_mask(w.float().detach(), keep_heads)
+    final_mask = convert_gate_to_mask(w.detach(), keep_heads)
     print_head_mask(final_mask)
 
     final_acc, _ = evaluate(model, eval_loader, head_mask=final_mask, desc="최종 평가")
@@ -433,14 +434,14 @@ def run_pipelined_dsp(
     print("-" * 80)
 
     # Learnable importance weights 초기화
-    w = nn.Parameter(torch.randn(num_layers, num_heads).double().to(DEVICE))
+    w = nn.Parameter(torch.randn(num_layers, num_heads).to(DEVICE))
     nn.init.xavier_uniform_(w)
 
     # Temperature scheduler (1 epoch용)
     num_training_steps = len(train_loader) * num_epochs_score
     temp_scheduler = TemperatureScheduler(
-        initial_temperature=1000.0,
-        final_temperature=1e-2,
+        initial_temperature=10.0,
+        final_temperature=0.1,
         cooldown_steps=num_training_steps,
     )
 
@@ -467,8 +468,8 @@ def run_pipelined_dsp(
 
             # Soft mask 생성 (differentiable!)
             soft_mask = gumbel_soft_top_k(
-                w.view(-1).float(), keep_heads, temperature
-            ).double().view_as(w)
+                w.view(-1), keep_heads, temperature
+            ).view_as(w)
 
             # Forward (BERT는 freeze됨)
             outputs = model(
@@ -483,6 +484,7 @@ def run_pipelined_dsp(
             # Backward (w만 업데이트!)
             optimizer_w.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_([w], 1.0)  # Gradient clipping for stability
             optimizer_w.step()
 
     print("\n학습된 importance weights:")
@@ -617,7 +619,7 @@ def main():
                 pruning_ratio=ratio,
                 train_loader=train_loader,
                 eval_loader=eval_loader,
-                num_epochs=2 if IN_COLAB else 3,
+                num_epochs=1 if IN_COLAB else 3,  # Paper: 3 epochs (same as pipelined base training)
                 use_ste=False,
                 log_interval=200,
             )
@@ -636,9 +638,9 @@ def main():
                 pruning_ratio=ratio,
                 train_loader=train_loader,
                 eval_loader=eval_loader,
-                num_epochs_base=1,
-                num_epochs_score=1,  # w를 1 epoch 학습
-                num_epochs_ft=2 if IN_COLAB else 3,
+                num_epochs_base=1 if IN_COLAB else 3,  # Paper: 3 epochs base training
+                num_epochs_score=1,  # Paper: 1 additional epoch for w learning
+                num_epochs_ft=1 if IN_COLAB else 3,  # Paper: fine-tune until convergence (~3 epochs)
                 log_interval=200,
             )
             all_results['pipelined_dsp'].append(result)
